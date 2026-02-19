@@ -5,9 +5,11 @@ This module provides a Model-Context-Protocol wrapper around
 the OWL Server functionality, allowing integration with other MCP systems.
 """
 
+from functools import wraps
 import os
 from pathlib import Path
-from typing import Optional
+import re
+from typing import Callable, Generic, Optional, TypeVar, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
@@ -15,9 +17,58 @@ from pydantic import BaseModel
 from owl_mcp.config import OWLMCPConfig, get_config_manager
 from owl_mcp.owl_api import SimpleOwlAPI
 
+import logging
+from mcp.server.fastmcp.utilities.logging import get_logger
+to_client_logger = get_logger(name="fastmcp.server.context.to_client")
+to_client_logger.setLevel(level=logging.ERROR)
+
+
+class PagedResult(TypedDict):
+    items: list
+    next_cursor: str | None
+    page_size: int
+    current_page: int
+    total_items: int
+
+
+def paginated(all_items: list, cursor: str = "0", page_size: int = 50) -> PagedResult:
+    """
+    Decorator to add cursor-based pagination to a FastMCP tool.
+
+    Wrapped tool must be an async generator yielding items in order.
+
+    Args:
+        page_size: Number of items per page.
+
+    Usage:
+        @paginate(page_size=20)
+        async def fn(...):
+            yield item1
+            yield item2
+            ...
+    """
+    skip = int(cursor)
+    items = []
+    
+    items = all_items[skip:skip + page_size]
+
+    next_cursor = str(skip + len(items)) if len(items) == page_size else None
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "page_size": page_size,
+        "current_page": skip // page_size,
+        "total_items": len(all_items),
+    }
+
+    
 # Initialize FastMCP server
 mcp = FastMCP(
     "owl-server",
+    log_level="ERROR",
+    host="127.0.0.1",
+    port=8080,
     instructions="""
 OWL Server provides tools for managing Web Ontology Language (OWL) ontologies.
 Use these tools to add, remove, and find axioms in OWL files, and to manage prefix mappings.
@@ -64,7 +115,7 @@ def add_subclass_of_prompt(child: str, parent: str) -> str:
 
 
 # Dictionary to cache SimpleOwlAPI instances
-_api_instances = {}
+_api_instances = dict()
 
 
 def _get_api_instance(owl_file_path: str, auto_register: bool = False) -> SimpleOwlAPI:
@@ -103,6 +154,7 @@ def _get_api_instance(owl_file_path: str, auto_register: bool = False) -> Simple
                 _api_instances[owl_file_path].register_in_config()
 
     return _api_instances[owl_file_path]
+
 
 
 @mcp.tool()
@@ -169,41 +221,201 @@ async def remove_axiom(owl_file_path: str, axiom_str: str) -> str:
 
 
 @mcp.tool()
-async def find_axioms(
-    owl_file_path: str,
-    pattern: str,
-    limit=100,
-    include_labels: bool = False,
-    annotation_property: Optional[str] = None,
-) -> list[str]:
+async def get_all_classes(owl_file_path: str, label_pattern: Optional[str]=None, cursor: str = "0") -> PagedResult:
     """
-    Find axioms matching a pattern in the ontology.
+    Get all classes defined in the ontology as their IRI and label.
+    
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        label_pattern: Optional regex pattern that class labels must match to be included
+        cursor: Cursor for pagination (default: "0")
+        
+    Returns:
+        PagedResult: PagedResult containing list of matching classes. Each class is represented as a dictionary with fields "iri" and "label".
+    """
+    api = _get_api_instance(owl_file_path)
+
+    # results = [f"{e['label']} [{e['iri']}]" for e in api.get_all_entities("class", True) if (not label_pattern or (e['label'] and re.search(label_pattern, e['label'])))]
+    results = [e for e in api.get_all_entities("class", True) if (not label_pattern or (e['label'] and re.search(label_pattern, e['label'])))]
+    
+    return paginated(results, cursor=cursor, page_size=50)
+
+@mcp.tool()
+async def search_class_by_definition(owl_file_path: str, search_pattern: str, cursor: str = "0") -> PagedResult:
+    """
+    Search for classes by matching their natural language definition to a pattern.
 
     Args:
         owl_file_path: Absolute path to the OWL file
-        pattern: A substring or regex pattern to match against axiom strings
-                 (supports full Python regex syntax, e.g., r"SubClassOf.*:Animal")
-        limit: (int) Maximum number of axioms to return (default: 100)
-        include_labels: If True, include human-readable labels after ## in the output
-        annotation_property: Optional annotation property IRI to use for labels
-                            (defaults to rdfs:label)
+        search_pattern: A substring or regex pattern to match against definitions
+                        (supports full Python regex syntax, e.g., r"vertebrate")
+        cursor: Cursor for pagination (default: "0")
 
     Returns:
-        list[str]: List of matching axiom strings
+        PagedResult: PagedResult containing list of matching classes. The dictionary contains the fields "iri", "label", and "definition"
     """
     api = _get_api_instance(owl_file_path)
-    if isinstance(limit, str):
-        # dumb AI may keep trying this with strings
-        limit = int(limit) if limit else 100
-    return api.find_axioms(
-        pattern, include_labels=include_labels, annotation_property=annotation_property
-    )[0:limit]
+
+    return paginated(api.search_definitions(search_pattern), cursor=cursor, page_size=50)
+
+@mcp.tool()
+async def search_class_by_name(owl_file_path: str, search_pattern: str, cursor: str = "0") -> PagedResult:
+    """
+    Search for classes by matching their name/label to a pattern.
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        search_pattern: A substring or regex pattern to match against class labels
+                        (supports full Python regex syntax, e.g., r"^A.*e$")
+        cursor: Cursor for pagination (default: "0")
+    Returns:
+        PagedResult: PagedResult containing list of matching classes. The dictionary contains the fields "iri", "label", and "definition"
+    """
+    
+    api = _get_api_instance(owl_file_path)
+
+    # results = [f"{e['label']} [{e['iri']}]" for e in api.get_all_entities("class", True) if (not label_pattern or (e['label'] and re.search(label_pattern, e['label'])))]
+    results = [e for e in api.get_all_entities("class", True) if (not search_pattern or (e['label'] and re.search(search_pattern, e['label'])))]
+    
+    return paginated(results, cursor=cursor, page_size=50)
+
+@mcp.tool()
+async def get_superclasses(owl_file_path: str, iri: str) -> list[str]:
+    """
+    Get the superclasses for a given IRI in the ontology up to the root ordered by distance (direct superclasses first).
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        iri: The IRI to get the superclasses for (as a string)
+
+    Returns:
+        list[str]: List of superclass IRIs
+    """
+    api = _get_api_instance(owl_file_path)
+    assert api.ontology is not None, "No ontology loaded!"
+    return sorted(api.ontology.get_superclasses(iri))
+
+@mcp.tool()
+async def get_subclasses(owl_file_path: str, iri: str, cursor: str = "0") -> PagedResult:
+    """
+    Get the direct subclasses for a given IRI in the ontology.
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        iri: The IRI to get the subclasses for (as a string)
+        cursor: Cursor for pagination (default: "0")
+
+    Returns:
+        PagedResult: PagedResult containing list of direct subclass IRIs
+    """
+    api = _get_api_instance(owl_file_path)
+    assert api.ontology is not None, "No ontology loaded!"
+    return paginated(sorted(api.ontology.get_subclasses(iri)), cursor=cursor, page_size=50)
+@mcp.tool()
+async def get_root_classes(owl_file_path: str) -> list[str]:
+    """
+    Get the root classes (direct subclasses of owl:Thing) in the ontology.
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+
+    Returns:
+        list[str]: List of root class IRIs
+    """
+    api = _get_api_instance(owl_file_path)
+    assert api.ontology is not None, "No ontology loaded!"
+    return sorted(api.ontology.get_subclasses("http://www.w3.org/2002/07/owl#Thing"))
+
+@mcp.tool()
+async def get_hierarchy(owl_file_path: str, root: Optional[str]=None, depth: int = 3) -> dict:
+    """
+    Get the class hierarchy for a given IRI in the ontology.
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        root: The IRI to get the hierarchy for (as a string). If None, use owl:Thing (root of every ontology)
+        depth: The depth of the hierarchy to retrieve (default: 3)
+
+    Returns:
+        dict: A dictionary representation of the class hierarchy
+    """
+    api = _get_api_instance(owl_file_path)
+    assert api.ontology is not None, "No ontology loaded!"
+
+    if not root:
+        root = "http://www.w3.org/2002/07/owl#Thing"
+        
+    root_node = dict()
+    hierarchy = {root: root_node}
+
+    queue = [(root, root_node, 1)]
+    while queue:
+        current_root, current_node, current_depth = queue.pop(0)
+        
+        if current_depth > depth:
+            continue
+        
+        children = api.ontology.get_subclasses(current_root)
+        for child in children:
+            current_node[child] = dict()
+            queue.append((child, current_node[child], current_depth + 1))
+
+    return hierarchy
+
+
+@mcp.tool()
+async def get_definition(owl_file_path: str, iri: str, annotation_property: Optional[str] = None) -> Optional[str]:
+    """
+    Get the definition for a given IRI in the ontology.
+
+    Args:
+        owl_file_path: Absolute path to the OWL file
+        iri: The IRI to get the definition for (as a string)
+        annotation_property: Optional annotation property IRI to use for definition
+                            (defaults to `IAO:0000115 (definition)` if None)
+
+    Returns:
+        Optional[str]: The definition if found, otherwise None
+    """
+    api = _get_api_instance(owl_file_path)
+    return next(iter(api.get_definition_for_iri(iri, annotation_property)), None)
+
+# @mcp.tool()
+# async def find_axioms(
+#     owl_file_path: str,
+#     pattern: str,
+#     limit=100,
+#     include_labels: bool = False,
+#     annotation_property: Optional[str] = None,
+# ) -> list[str]:
+#     """
+#     Find axioms matching a pattern in the ontology.
+
+#     Args:
+#         owl_file_path: Absolute path to the OWL file
+#         pattern: A substring or regex pattern to match against axiom strings
+#                  (supports full Python regex syntax, e.g., r"SubClassOf.*:Animal")
+#         limit: (int) Maximum number of axioms to return (default: 100)
+#         include_labels: If True, include human-readable labels after ## in the output
+#         annotation_property: Optional annotation property IRI to use for labels
+#                             (defaults to rdfs:label)
+
+#     Returns:
+#         list[str]: List of matching axiom strings
+#     """
+#     api = _get_api_instance(owl_file_path)
+#     if isinstance(limit, str):
+#         # dumb AI may keep trying this with strings
+#         limit = int(limit) if limit else 100
+#     return api.find_axioms(
+#         pattern, include_labels=include_labels, annotation_property=annotation_property
+#     )[0:limit]
 
 
 @mcp.tool()
 async def get_all_axioms(
     owl_file_path: str,
-    limit=100,
+    limit: int =100,
     include_labels: bool = False,
     annotation_property: Optional[str] = None,
 ) -> list[str]:
@@ -220,6 +432,11 @@ async def get_all_axioms(
     Returns:
         list[str]: List of all axiom strings
     """
+    try:
+        limit = int(limit)
+    except:
+        limit = 100
+    
     api = _get_api_instance(owl_file_path)
     return api.get_all_axiom_strings(
         include_labels=include_labels, annotation_property=annotation_property
@@ -672,6 +889,24 @@ async def add_prefix_by_name(ontology_name: str, prefix: str, uri: str) -> str:
 
     return await add_prefix(owl_file_path, prefix, uri)
 
+@mcp.tool()
+async def get_iri_for_label(ontology_name: str, label: str) -> Optional[str]:
+    """
+    Get the IRI for a given label in a configured ontology.
+
+    Args:
+        ontology_name: Name of the ontology as defined in configuration
+        label: The label to find the IRI for
+
+    Returns:
+        Optional[str]: The IRI if found, otherwise None
+    """
+    owl_file_path = _get_ontology_path_by_name(ontology_name)
+    if not owl_file_path:
+        return None
+
+    api = _get_api_instance(owl_file_path)
+    return api.get_iri_for_label(ontology_name, label)
 
 @mcp.tool()
 async def get_labels_for_iri(
@@ -715,12 +950,11 @@ async def get_labels_for_iri_by_name(
 
     return await get_labels_for_iri(owl_file_path, iri, annotation_property)
 
-
 def main():
     """
     Run the MCP server.
     """
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio", )
 
 
 if __name__ == "__main__":

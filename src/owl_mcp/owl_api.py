@@ -1,3 +1,4 @@
+from functools import cache, lru_cache
 import hashlib
 import logging
 import os
@@ -7,7 +8,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import pyhornedowl
 from pyhornedowl.model import Import, OntologyAnnotation
@@ -20,7 +21,7 @@ from owl_mcp.xml_catalog_utils import read_catalog
 from .axiom_parser import parse_axiom_string, serialize_axioms
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.ERROR, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("simple-owl-api")
 
@@ -112,6 +113,19 @@ class SimpleOwlAPI:
         if ontology_config and ontology_config.metadata_axioms:
             self.pending_metadata_axioms = ontology_config.metadata_axioms
 
+        # Initialize normalize_after_save before loading ontology since load can trigger save
+        if normalize_after_save is None:
+            path_to_makefile = Path(self.owl_file_path).parent / "Makefile"
+            if path_to_makefile.exists():
+                # read the makefile and look for a rule that normalizes the ontology
+                with open(path_to_makefile) as f:
+                    for line in f:
+                        if line.startswith(MAKEFILE_NORMALIZE_RULE):
+                            normalize_after_save = True
+                            break
+
+        self.normalize_after_save = normalize_after_save
+
         # Try to load the ontology
         self.load_ontology(create_if_not_exists=create_if_not_exists)
 
@@ -132,18 +146,6 @@ class SimpleOwlAPI:
                 except Exception as e:
                     logger.warning(f"Failed to add metadata axiom: {axiom_str}. Error: {e}")
             self.pending_metadata_axioms = []
-
-        if normalize_after_save is None:
-            path_to_makefile = Path(self.owl_file_path).parent / "Makefile"
-            if path_to_makefile.exists():
-                # read the makefile and look for a rule that normalizes the ontology
-                with open(path_to_makefile) as f:
-                    for line in f:
-                        if line.startswith(MAKEFILE_NORMALIZE_RULE):
-                            normalize_after_save = True
-                            break
-
-        self.normalize_after_save = normalize_after_save
 
         # Set up file monitoring
         self._setup_file_monitoring()
@@ -418,6 +420,71 @@ class SimpleOwlAPI:
 
             return matching_axioms
 
+    @lru_cache(maxsize=16)
+    def search_definitions(self, search_pattern: str) -> list[dict[str, str]]:
+        if self.ontology is None:
+            raise ValueError("No ontology loaded!")
+
+        with self.lock:
+            results = []
+            pattern = re.compile(search_pattern, re.IGNORECASE)
+            for entity in sorted(self.ontology.get_classes()):
+                definitions = self.ontology.get_annotations(
+                    entity,
+                    "http://purl.obolibrary.org/obo/IAO_0000115",
+                )
+                for definition in definitions:
+                    if pattern.search(definition):
+                        results.append({
+                            "iri": entity,
+                            "label": self.ontology.get_annotation(entity, "rdfs:label"),
+                            "definition": definition
+                        })
+                        
+            return results
+
+    def get_all_entities(self, kind: Literal["class", "objectproperty", "dataproperty", "individual", "annotationproperty", "datatypes"], include_labels: bool = False, annotation_property: Optional[str] = None, include_imports: bool = True) -> list[dict[str, str]]:
+        if self.ontology is None:
+            raise ValueError("No ontology loaded!")
+        
+        def get_entities(o: pyhornedowl.PyIndexedOntology):
+            if kind == "class":
+                return o.get_classes()
+            elif kind == "dataproperty":
+                return o.get_data_properties()
+            elif kind == "objectproperty":
+                return o.get_object_properties()
+            elif kind == "individual":
+                return o.get_named_individuals()
+            elif kind == "annotationproperty":
+                return o.get_annotation_properties()
+            elif kind == "datatypes":
+                return o.get_datatypes()
+
+        with self.lock:
+            if include_imports and self.import_map:
+                entities = []
+                for ontology in self.import_map.values():
+                    entities.extend(get_entities(ontology))
+            else:
+                entities = get_entities(self.ontology)
+
+        return sorted([
+            {
+                "iri": entity,
+                "label": next(iter(self.get_labels_for_iri(entity, annotation_property)), "None") if include_labels else "None"
+            }
+            for entity in entities
+        ], key=lambda x: x["iri"])
+
+    def get_definition_for_iri(self, iri: str, annotation_property: Optional[str] = None) -> list[str]:
+        if self.ontology is None:
+            raise ValueError("No ontology loaded!")
+        
+        with self.lock:
+            return self.ontology.get_annotations(iri, annotation_property or "http://purl.obolibrary.org/obo/IAO_0000115")
+            
+
     def get_all_axiom_strings(
         self,
         include_labels: bool = False,
@@ -471,6 +538,7 @@ class SimpleOwlAPI:
                 logger.warning(f"Cannot add prefix to readonly ontology: {self.owl_file_path}")
                 return False
 
+            prefix = prefix.strip(":")
             self.ontology.add_prefix_mapping(prefix, uri)
 
             # Save only if not readonly or explicitly bypassing readonly
@@ -589,6 +657,39 @@ class SimpleOwlAPI:
         if callback in self.observers:
             self.observers.remove(callback)
 
+    def get_iri_for_label(self, ontology_name: str, label: str) -> Optional[str]:
+        """
+        Get the IRI for a given label in a configured ontology.
+
+        Args:
+            ontology_name: Name of the ontology as defined in configuration
+            label: The label to find the IRI for
+
+        Returns:
+            Optional[str]: The IRI if found, otherwise None
+        """
+        with self.lock:
+            iri = self.ontology.get_iri_for_label(label)
+            return iri
+        
+    def query_ontology(self, query: str) -> list[str]:
+        """        Execute a SPARQL-like query on the ontology.
+        Args:
+            query: The query string to execute
+            
+        Returns:
+            List of results as strings
+        """
+        with self.lock:
+            if not self.ontology:
+                raise ValueError("Ontology is not loaded")
+            try:
+                results = self.ontology.query(query)
+                return [str(result) for result in results]
+            except Exception as e:
+                logger.error(f"Error executing query '{query}': {e}")
+                return []
+
     def get_labels_for_iri(
         self, iri: str, annotation_property: Optional[str] = None, include_imports: bool = True
     ) -> list[str]:
@@ -604,33 +705,21 @@ class SimpleOwlAPI:
         Returns:
             List of label strings
         """
+        if self.ontology is None:
+            raise ValueError("No ontology loaded!")
+        
         with self.lock:
             # Use the instance's annotation_property field as default
             label_property = annotation_property or self.annotation_property
 
-            # Check if iri is a CURIE (e.g. "ex:Person") and handle appropriately
-            if ":" in iri and not iri.startswith(("http://", "https://")):
-                # This is a prefixed IRI, we need to get the full IRI
-                prefix, local = iri.split(":", 1)
-                # Get all prefixes to find the right one
-                prefixes = self.ontology.prefix_mapping
-                if prefix in prefixes:
-                    full_iri = f"{prefixes[prefix]}{local}"
-                else:
-                    logger.warning(f"Prefix '{prefix}' not found in ontology")
-                    return []
-            else:
-                # Already a full IRI
-                full_iri = iri
-
             # Get all annotations for this IRI with the specified property
-            labels = self.ontology.get_annotations(full_iri, label_property)
+            labels = self.ontology.get_annotations(iri, label_property)
             if include_imports and self.import_map:
                 labels = []
                 for ontology in self.import_map.values():
-                    labels.extend(ontology.get_annotations(full_iri, label_property))
+                    labels.extend(ontology.get_annotations(iri, label_property))
             else:
-                labels = self.ontology.get_annotations(full_iri, label_property)
+                labels = self.ontology.get_annotations(iri, label_property)
 
             return labels
 
